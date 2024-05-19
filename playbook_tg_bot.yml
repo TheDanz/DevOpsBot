@@ -1,0 +1,223 @@
+- name: db_depl
+  vars_files:
+    - secrets.yml
+  hosts: db
+  become: yes
+
+  tasks:
+
+  - name: Check if /app exists
+    stat:
+      path: /app
+    register: dir_stat
+
+  - name: Skip if exists
+    meta: end_play
+    when: dir_stat.stat.exists
+
+  - name: require
+    apt:
+      name:
+        - python3
+        - python3-pip
+        - python3-venv
+        - python-is-python3
+        - postgresql
+        - postgresql-contrib
+      state: latest
+      update_cache: yes
+
+  - name: Install bot requirements
+    pip:
+      name:
+        - paramiko==3.4.0
+        - psycopg2==2.9.9
+        - python-dotenv==1.0.1
+        - python-telegram-bot==13.7
+        - urllib3==1.26.15
+      extra_args: --break-system-packages
+
+  - name: Get postgresql config file path
+    postgresql_query:
+      db: postgres
+      query: SHOW config_file;
+    become: true
+    become_user: postgres
+    register: config_file_path
+
+  - name: Set postgres config
+    lineinfile:
+      path: "{{ config_file_path.query_result[0].config_file }}"
+      regexp: '^[#\s]*{{ item.param_name }}\s*='
+      line: "{{ item.param_name }} = {{ item.param_value }}"
+      state: present
+    with_items:
+      - {param_name: max_wal_senders, param_value: 10}
+      - {param_name: wal_level, param_value: replica}
+      - {param_name: wal_log_hints, param_value: on}
+      - {param_name: hot_standby, param_value: on}
+      - {param_name: max_replication_slots, param_value: 10}
+      - {param_name: hot_standby_feedback, param_value: on}
+      - {param_name: log_replication_commands, param_value: on}
+      - {param_name: logging_collector, param_value: on}
+      - {param_name: log_directory, param_value: "'/app/db_logs'"}
+      - {param_name: port, param_value: "{{ DB_PORT }}" }
+      - {param_name: listen_addresses, param_value: "'localhost, {{DB_HOST}}, {{DB_REPL_HOST}}'" }
+ 
+  - name: Get pg_hba file destination
+    postgresql_query:
+      db: postgres
+      query: SHOW hba_file;
+    become: true
+    become_user: postgres
+    register: pg_hba_dest
+
+  - name: Set up pb_hba.conf
+    template:
+      src: pg_hba.conf
+      dest: '{{pg_hba_dest.query_result[0].hba_file}}'
+      owner: postgres
+      group: postgres
+
+  - name: Create db
+    community.postgresql.postgresql_db:
+      name: '{{DB_DATABASE}}'
+    become: true
+    become_user: postgres
+
+  - name: Init db actions
+    postgresql_query:
+      db: '{{DB_DATABASE}}'
+      query: "{{item}}"
+    become: true
+    become_user: postgres
+    with_items:
+      - CREATE TABLE IF NOT EXISTS emails (id SERIAL PRIMARY KEY, mail VARCHAR(50));
+      - INSERT INTO emails(mail) VALUES ('ryumin.danmil01@mail.ru'), ('ignasheva@yamdex.ru');
+      - CREATE TABLE IF NOT EXISTS phones (id SERIAL PRIMARY KEY, phone VARCHAR(25));
+      - INSERT INTO phones(phone) VALUES ('89210650228'), ('+7(981)1239383');
+      - "create user {{DB_REPL_USER}} with replication encrypted password '{{DB_REPL_PASSWORD}}';"
+      - "create user {{DB_USER}} with password '{{DB_PASSWORD}}';"
+      - "GRANT SELECT, INSERT ON TABLE emails TO {{DB_USER}};"
+      - "GRANT SELECT, INSERT ON TABLE phones TO {{DB_USER}};"
+      - "GRANT USAGE ON SEQUENCE emails_id_seq TO {{DB_USER}};"
+      - "GRANT USAGE ON SEQUENCE phones_id_seq TO {{DB_USER}};"
+
+  - name: Create app dir
+    file:
+      path: /app
+      state: directory
+      mode: '0755'
+
+  - name: Create db_logs dir
+    file:
+      path: /app/db_logs
+      state: directory
+      mode: '0755'
+      owner: postgres
+      group: postgres
+
+  - name: postgres reboot
+    ansible.builtin.service:
+      name: postgresql
+      state: restarted
+
+
+- name: db_repl_depl
+  vars_files:
+    - secrets.yml
+  hosts: db_repl
+  become: yes
+
+  tasks:
+
+  - name: require
+    apt:
+      name:
+        - postgresql
+        - postgresql-contrib
+        - python3
+        - python3-psycopg2
+      state: latest
+      update_cache: yes
+
+  - name: Get postgresql config file path
+    postgresql_query:
+      db: postgres
+      query: SHOW config_file;
+    become: true
+    become_user: postgres
+    register: config_file_path
+
+  - name: Set postgres config
+    lineinfile:
+      path: "{{ config_file_path.query_result[0].config_file }}"
+      regexp: '^[#\s]*{{ item.param_name }}\s*='
+      line: "{{ item.param_name }} = {{ item.param_value }}"
+      state: present
+    with_items:
+      - {param_name: listen_addresses, param_value: "'localhost, {{DB_HOST}}'" }
+
+  - name: Get data_directory
+    postgresql_query:
+      db: postgres
+      query: SHOW data_directory;
+    become: true
+    become_user: postgres
+    register: data_directory
+
+  - name: Stop postgres
+    ansible.builtin.service:
+      name: postgresql
+      state: stopped
+
+  - name: Clean data_directory
+    file:
+      path: '{{data_directory.query_result[0].data_directory}}'
+      state: absent
+
+  - name: Make a backup
+    command: 
+      cmd: 'bash -c "pg_basebackup -R -h {{DB_HOST}} -U {{DB_REPL_USER}} -D {{data_directory.query_result[0].data_directory}} -P --port {{DB_PORT}}"'
+      creates: "{{data_directory.query_result[0].data_directory}}/*"
+    become: true
+    become_user: postgres
+    environment:
+      PGPASSWORD: "{{DB_REPL_PASSWORD}}"
+
+  - name: Start postgres
+    ansible.builtin.service:
+      name: postgresql
+      state: started
+
+
+- name: bot
+  vars_files:
+    - secrets.yml
+  hosts: db
+  become: yes
+
+  tasks:
+
+  - name: cloning bot
+    ansible.builtin.get_url:
+      url: "https://github.com/TheDanz/DevOps_Telegram_Bot/tree/docker/bot/{{item}}"
+      dest: "/app/{{item}}"
+      mode: '0755'
+    with_items:
+      - bot.py
+      - requirements.txt
+  
+  - name: Launching bot
+    command: python /app/bot.py &
+    environment:
+      TOKEN: "{{TOKEN}}"
+      RM_USER: "{{RM_USER}}"
+      RM_PASSWORD: "{{RM_PASSWORD}}"
+      RM_HOST: "{{RM_HOST}}"
+      RM_PORT: "{{RM_PORT}}"
+      DB_USER: "{{DB_USER}}"
+      DB_PASSWORD: "{{DB_PASSWORD}}"
+      DB_HOST: "{{DB_HOST}}"
+      DB_PORT: "{{DB_PORT}}"
+      DB_DATABASE: "{{DB_DATABASE}}"
